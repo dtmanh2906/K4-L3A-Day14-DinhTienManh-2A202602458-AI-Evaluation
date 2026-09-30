@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import APIConnectionError, APITimeoutError, OpenAI, OpenAIError
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -239,30 +239,96 @@ class BM25Retriever:
 
 
 class TextGenerator(Protocol):
-    def generate(self, prompt: str) -> str: ...
+    def generate(self, prompt: str, request_id: str | None = None) -> str: ...
 
 
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        configured_model = os.getenv("GEMINI_MODEL", "").strip()
+        self.model = configured_model or "gemini-3.8-flash"
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
-        if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError("GEMINI_API_KEY is missing from .env")
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
         self.max_output_tokens = max_output_tokens
 
-    def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
+    def generate(self, prompt: str, request_id: str | None = None) -> str:
+        transient_statuses = {429, 500, 502, 503, 504}
+        non_retryable_statuses = {401, 403}
+        max_retries = 5
+        response = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                )
+                break
+            except (OpenAIError, ConnectionError, TimeoutError) as exc:
+                status_code = getattr(exc, "status_code", None)
+                error_text = " ".join(
+                    str(value)
+                    for value in (
+                        exc,
+                        getattr(exc, "body", ""),
+                        getattr(exc, "response", ""),
+                    )
+                ).casefold().replace("_", " ")
+                quota_exhausted = status_code == 429 and any(
+                    marker in error_text
+                    for marker in (
+                        "resource exhausted",
+                        "quota exceeded",
+                        "exceeded your current quota",
+                    )
+                )
+                if quota_exhausted:
+                    print(
+                        f"[{request_id or 'unknown'}] quota/resource exhausted; "
+                        "stopping without retry.",
+                        flush=True,
+                    )
+                    raise
+
+                is_transient_exception = isinstance(
+                    exc,
+                    (APIConnectionError, APITimeoutError, ConnectionError, TimeoutError),
+                )
+                is_transient_status = status_code in transient_statuses
+                if (
+                    status_code in non_retryable_statuses
+                    or not (is_transient_exception or is_transient_status)
+                    or attempt >= max_retries
+                ):
+                    raise
+
+                retry_number = attempt + 1
+                delay_seconds = 2 ** retry_number
+                error_label = (
+                    f"HTTP {status_code}"
+                    if status_code is not None
+                    else exc.__class__.__name__
+                )
+                print(
+                    f"[{request_id or 'unknown'}] transient LLM error ({error_label}); "
+                    f"retry attempt {retry_number}/{max_retries} in "
+                    f"{delay_seconds}s.",
+                    flush=True,
+                )
+                time.sleep(delay_seconds)
+
+        if response is None:
+            raise RuntimeError("LLM request did not return a response")
+
+        answer = (response.choices[0].message.content or "").strip()
         if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
+            raise RuntimeError("Gemini returned an empty answer")
         return answer
 
 
@@ -309,10 +375,12 @@ class DomainAssistant:
     def answer(self, question: str) -> str:
         return self.answer_with_trace(question).actual_answer
 
-    def answer_with_trace(self, question: str) -> DomainResponse:
+    def answer_with_trace(
+        self, question: str, request_id: str | None = None
+    ) -> DomainResponse:
         chunks = self.retriever.retrieve(question, self.top_k)
         prompt = _build_prompt(question, chunks)
-        answer = self.generator.generate(prompt).strip()
+        answer = self.generator.generate(prompt, request_id=request_id).strip()
         if not answer:
             raise RuntimeError("Generator returned an empty answer")
         return DomainResponse(question.strip(), answer, tuple(chunks))
@@ -380,16 +448,71 @@ def generate_actual_answers(
     generator: TextGenerator | None = None,
     top_k: int = 5,
     progress: ProgressCallback | None = None,
+    output_path: str | Path = Path("artifacts/actual_answers.json"),
 ) -> dict[str, Any]:
-    """Generate the auditable actual-answer artifact for all dataset questions."""
+    """Generate the auditable actual-answer artifact for all dataset questions.
+
+    When ``output_path`` points to an existing artifact, completed answers are
+    reused and only missing or failed IDs are generated.
+    """
 
     def notify(message: str) -> None:
         if progress is not None:
             progress(message)
 
     dataset_file = Path(dataset_path).expanduser().resolve()
+    output_file = (
+        Path(output_path).expanduser().resolve()
+        if output_path is not None
+        else None
+    )
     notify(f"Loading golden questions: {dataset_file}")
     dataset_corpus_id, questions = _load_questions(dataset_file)
+
+    expected_questions = {item["id"]: item["question"] for item in questions}
+    answers_by_id: dict[str, dict[str, Any]] = {}
+    if output_file is not None and output_file.exists():
+        try:
+            existing_artifact = json.loads(output_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Existing actual-answer artifact is not valid JSON: {output_file}: "
+                f"{exc.msg}"
+            ) from exc
+        if not isinstance(existing_artifact, dict):
+            raise ValueError("Existing actual-answer artifact must be a JSON object")
+        if existing_artifact.get("corpus_id") != dataset_corpus_id:
+            raise ValueError(
+                "Existing actual-answer artifact uses a different corpus_id"
+            )
+
+        existing_answers = existing_artifact.get("answers", [])
+        if not isinstance(existing_answers, list):
+            raise ValueError("Existing actual-answer artifact answers must be a list")
+        for record in existing_answers:
+            if not isinstance(record, dict):
+                raise ValueError("Existing actual-answer records must be objects")
+            record_id = record.get("id")
+            if record_id not in expected_questions:
+                continue
+            if record.get("question") != expected_questions[record_id]:
+                raise ValueError(
+                    f"Existing actual answer question differs for {record_id}"
+                )
+            answers_by_id[record_id] = record
+
+        loaded_completed = sum(
+            1
+            for record in answers_by_id.values()
+            if isinstance(record.get("actual_answer"), str)
+            and bool(record["actual_answer"].strip())
+            and record.get("error") is None
+        )
+        notify(
+            f"Resume: loaded {loaded_completed} completed answers from "
+            f"{output_file}"
+        )
+
     notify(f"Loading and indexing corpus: {Path(corpus_dir).expanduser().resolve()}")
     assistant = DomainAssistant.from_corpus(corpus_dir, generator, top_k)
     if assistant.corpus_id != dataset_corpus_id:
@@ -405,12 +528,67 @@ def generate_actual_answers(
         f"model={model}, top_k={top_k}"
     )
 
-    answers: list[dict[str, Any]] = []
+    generated_at = datetime.now(UTC).isoformat()
+
+    def build_artifact() -> dict[str, Any]:
+        return {
+            "schema_version": "1.0",
+            "corpus_id": assistant.corpus_id,
+            "generated_at": generated_at,
+            "agent": {
+                "name": "domain-assistant",
+                "model": model,
+                "top_k": top_k,
+                "prompt_version": "1.0",
+            },
+            "answers": [
+                answers_by_id[item["id"]]
+                for item in questions
+                if item["id"] in answers_by_id
+            ],
+        }
+
+    def save_artifact() -> None:
+        if output_file is None:
+            return
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = output_file.with_name(f".{output_file.name}.tmp")
+        temporary_file.write_text(
+            json.dumps(build_artifact(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary_file.replace(output_file)
+        completed_count = sum(
+            1
+            for record in answers_by_id.values()
+            if isinstance(record.get("actual_answer"), str)
+            and bool(record["actual_answer"].strip())
+            and record.get("error") is None
+        )
+        notify(
+            f"Checkpoint saved: {output_file} "
+            f"({completed_count}/{len(questions)} completed)"
+        )
+
     for index, item in enumerate(questions, start=1):
         percentage = index / total
         completed_before = index - 1
         filled_before = round(20 * completed_before / total)
         bar_before = "#" * filled_before + "-" * (20 - filled_before)
+
+        previous = answers_by_id.get(item["id"])
+        if (
+            previous is not None
+            and isinstance(previous.get("actual_answer"), str)
+            and bool(previous["actual_answer"].strip())
+            and previous.get("error") is None
+        ):
+            notify(
+                f"[{bar_before}] {completed_before:02d}/{total:02d} | "
+                f"{item['id']} SKIP (answer already completed)"
+            )
+            continue
+
         question_preview = re.sub(r"\s+", " ", item["question"]).strip()
         if len(question_preview) > 58:
             question_preview = f"{question_preview[:55]}..."
@@ -421,28 +599,29 @@ def generate_actual_answers(
 
         started_at = time.perf_counter()
         try:
-            response = assistant.answer_with_trace(item["question"])
+            response = assistant.answer_with_trace(
+                item["question"], request_id=item["id"]
+            )
         except Exception:
             notify(f"FAILED at {item['id']}; stopping the run.")
             raise
 
-        answers.append(
-            {
-                "id": item["id"],
-                "question": item["question"],
-                "actual_answer": response.actual_answer,
-                "retrieved_contexts": [
-                    {
-                        "source_doc": chunk.source_doc,
-                        "chunk_id": chunk.chunk_id,
-                        "text": chunk.text,
-                        "score": round(chunk.score, 6),
-                    }
-                    for chunk in response.retrieved_chunks
-                ],
-                "error": None,
-            }
-        )
+        answers_by_id[item["id"]] = {
+            "id": item["id"],
+            "question": item["question"],
+            "actual_answer": response.actual_answer,
+            "retrieved_contexts": [
+                {
+                    "source_doc": chunk.source_doc,
+                    "chunk_id": chunk.chunk_id,
+                    "text": chunk.text,
+                    "score": round(chunk.score, 6),
+                }
+                for chunk in response.retrieved_chunks
+            ],
+            "error": None,
+        }
+        save_artifact()
 
         filled_after = round(20 * percentage)
         bar_after = "#" * filled_after + "-" * (20 - filled_after)
@@ -452,18 +631,7 @@ def generate_actual_answers(
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
 
-    return {
-        "schema_version": "1.0",
-        "corpus_id": assistant.corpus_id,
-        "generated_at": datetime.now(UTC).isoformat(),
-        "agent": {
-            "name": "domain-assistant",
-            "model": model,
-            "top_k": top_k,
-            "prompt_version": "1.0",
-        },
-        "answers": answers,
-    }
+    return build_artifact()
 
 
 def parse_args() -> argparse.Namespace:
@@ -495,13 +663,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        output = args.output.expanduser().resolve()
         artifact = generate_actual_answers(
             args.dataset,
             args.corpus_dir,
             top_k=args.top_k,
             progress=lambda message: print(message, flush=True),
+            output_path=output,
         )
-        output = args.output.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         print(f"Saving actual-answer artifact: {output}", flush=True)
         output.write_text(
